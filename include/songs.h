@@ -1,9 +1,10 @@
 #ifndef SONGS_H
 #define SONGS_H
 
+#include <stdint.h>
 #include "orchestra.h"
 
-// Song IDs
+// Numeric Song IDs (used by main.c to pick songs)
 #define SONG_JUPITER_HYMN       0
 #define SONG_CANON_IN_D         1
 #define SONG_CARNIVAL_THEME     2
@@ -56,14 +57,14 @@
 #define SIXTEENTH_NOTE  125
 
 // Part masks for multi-part songs
-#define PART_1   0x01
-#define PART_2   0x02
-#define PART_3   0x04
-#define PART_4   0x08
-#define PART_5   0x10
-#define ALL_PARTS 0x1F
+#define PART_1     0x01
+#define PART_2     0x02
+#define PART_3     0x04
+#define PART_4     0x08
+#define PART_5     0x10
+#define ALL_PARTS  0x1F
 
-// External song arrays
+// External song arrays (must be defined in songs.c)
 extern const song_t songs[];
 extern const uint8_t total_songs;
 

@@ -51,7 +51,7 @@ typedef enum {
 typedef struct {
     msg_type_t type;
     uint8_t song_id;
-    uint32_t timestamp;
+    uint64_t timestamp; // microseconds since boot (esp_timer_get_time())
     uint8_t sender_id;
 } espnow_msg_t;
 

@@ -1,37 +1,111 @@
+Orchestra on ESP32 (M5Stack Core)
 
-This directory is intended for project header files.
+This project turns multiple ESP32-based devices (M5Stack Core) into a distributed orchestra.
+Each device is assigned a role (Conductor or Performer Part 1–4). Together they synchronize playback of a song, with per-device parts or frequency transforms to create harmony.
 
-A header file is a file containing C declarations and macro definitions
-to be shared between several project source files. You request the use of a
-header file in your project source file (C, C++, etc) located in `src` folder
-by including it, with the C preprocessing directive `#include'.
+The Conductor never plays audio—it only broadcasts sync messages. Performers play their assigned role’s part and show role-specific animations.
 
-```src/main.c
+Roles
 
-#include "header.h"
+ROLE_CONDUCTOR
 
-int main (void)
-{
- ...
-}
-```
+Silent (no sound output)
 
-Including a header file produces the same results as copying the header file
-into each source file that needs it. Such copying would be time-consuming
-and error-prone. With a header file, the related declarations appear
-in only one place. If they need to be changed, they can be changed in one
-place, and programs that include the header file will automatically use the
-new version when next recompiled. The header file eliminates the labor of
-finding and changing all the copies as well as the risk that a failure to
-find one copy will result in inconsistencies within a program.
+Displays an idle screen
 
-In C, the convention is to give header files names that end with `.h'.
+Handles button input to start/stop/skip songs
 
-Read more about using header files in official GCC documentation:
+Broadcasts control messages to all performers over ESP-NOW
 
-* Include Syntax
-* Include Operation
-* Once-Only Headers
-* Computed Includes
+ROLE_PART_1 ... ROLE_PART_4
 
-https://gcc.gnu.org/onlinedocs/cpp/Header-Files.html
+Performers that play actual notes
+
+Each role may play original melody, octave shifts, or harmonized parts
+
+Display animations are colored according to role
+
+Display
+
+Idle screen: Solid blue background until playback starts.
+
+During playback: A lightweight equalizer animation pulses with each note. Colors match the device’s role:
+
+Part 1 → Green
+
+Part 2 → Yellow
+
+Part 3 → Cyan/Blue
+
+Part 4 → Orange
+
+Conductor → Purple (but conductor stays idle)
+
+The display system is optimized for minimal RAM devices: only a single scanline buffer is used.
+
+Audio
+
+I²S DAC output on pin 25 (M5Stack Core built-in speaker).
+
+Sample rate: 44.1kHz.
+
+Each note is generated as a sine wave.
+
+Parts can be explicitly defined in a song, or automatically transformed from the main melody.
+
+Building & Flashing
+
+The role of each device is selected at build time.
+
+Conductor
+pio run -e conductor -t upload
+pio device monitor -e conductor --baud 115200
+
+Performers
+pio run -e part1 -t upload
+pio run -e part2 -t upload
+pio run -e part3 -t upload
+pio run -e part4 -t upload
+
+
+If your device is on a different port:
+
+pio run -e part2 -t upload --upload-port COM8
+
+Button Controls (Conductor only)
+
+A (left) → STOP playback
+
+B (middle) → Toggle play/stop current song
+
+C (right) → Next song
+
+Performers ignore button presses.
+
+Project Structure
+src/
+  main.c           # Conductor/performer entry point
+  audio.c          # Audio playback (I²S, sine wave generator, role transforms)
+  display.c        # Display driver and idle screen
+  display_animations.c  # Low-RAM equalizer animation
+  device_config.c  # Role setup and config persistence
+  orchestra.c      # High-level orchestration logic
+  songs.c/.h       # Song definitions and parts
+include/
+  *.h              # Shared headers across modules
+
+Sync
+
+Devices synchronize playback over ESP-NOW.
+
+Timing jitter is under ~10 ms → “good enough” for musical ensemble playback.
+
+Listeners won’t notice drift unless playing very percussive tracks.
+
+Next Steps
+
+Add more songs with explicit per-part melodies.
+
+Improve bar-synchronized start (for even tighter sync).
+
+Experiment with different display animations.

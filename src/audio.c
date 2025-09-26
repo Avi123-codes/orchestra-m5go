@@ -1,39 +1,56 @@
+// src/audio.c
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2s.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+
 #include "songs.h"
+#include "device_config.h"
+#include "display_animations.h"
 
 static const char *TAG = "AUDIO";
 
-// M5Stack Core speaker configuration
-#define SPEAKER_PIN     25
-#define SAMPLE_RATE     44100
-#define DMA_BUF_COUNT   8
-#define DMA_BUF_LEN     64
+// ----------------------
+// Audio configuration
+// ----------------------
+#define SAMPLE_RATE       44100
+#define DMA_BUF_COUNT     8
+#define DMA_BUF_LEN       64
 
+// Tick timing (make sure SAMPLE_RATE * TICK_MS / 1000 is an integer)
+#ifndef AUDIO_TICK_MS
+#define AUDIO_TICK_MS     10          // 10 ms => 100 ticks/sec
+#endif
+#define SAMPLES_PER_TICK  (SAMPLE_RATE * AUDIO_TICK_MS / 1000)
+
+// ----------------------
 // Audio state
-static bool audio_playing = false;
-static float volume = 0.15f;
-static TaskHandle_t playback_task_handle = NULL;
+// ----------------------
+static bool          audio_playing = false;
+static float         volume = 0.08f;        // 0..1
+static TaskHandle_t  playback_task_handle = NULL;
 
-// Generate sine wave samples for a frequency
-static void generate_tone(int16_t *buffer, size_t samples, uint16_t freq) {
-    static float phase = 0;
-    float phase_increment = 2.0f * M_PI * freq / SAMPLE_RATE;
+// ----------------------
+// Animation helpers
+// ----------------------
+static inline float clamp01(float x){ return x<0.f?0.f:(x>1.f?1.f:x); }
 
-    for (size_t i = 0; i < samples; i++) {
-        buffer[i] = (int16_t)(sinf(phase) * 32767 * volume);
-        phase += phase_increment;
-        if (phase >= 2.0f * M_PI) {
-            phase -= 2.0f * M_PI;
-        }
-    }
+static float pulse_intensity_for_note(uint16_t freq, uint16_t dur_ms) {
+    if (freq == 0) return 0.0f; // rest
+    float nf = (float)freq / 1000.0f;        // ~0.2..2.0 typical
+    float nd = 220.0f / (float)(dur_ms + 50);// shorter -> stronger
+    float base = 0.25f + 0.55f * clamp01(nf);
+    float shaped = base * clamp01(nd);
+    return clamp01(shaped + 0.10f);          // ~0.1..0.9
 }
 
-// Initialize I2S for audio output
+// ----------------------
+// I2S setup
+// ----------------------
 static void audio_init_i2s(void) {
     i2s_config_t i2s_config = {
         .mode = I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN,
@@ -47,96 +64,168 @@ static void audio_init_i2s(void) {
         .use_apll = false,
         .tx_desc_auto_clear = true,
     };
-
     ESP_ERROR_CHECK(i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL));
     ESP_ERROR_CHECK(i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN));
     ESP_ERROR_CHECK(i2s_set_pin(I2S_NUM_0, NULL));
-
-    ESP_LOGI(TAG, "I2S audio initialized");
+    ESP_LOGI(TAG, "I2S audio initialized (%d Hz, %d-sample tick)", SAMPLE_RATE, SAMPLES_PER_TICK);
 }
 
-// Play a single note
-static void play_note(uint16_t frequency, uint16_t duration_ms) {
-    if (frequency == 0) {
-        // REST note
-        vTaskDelay(pdMS_TO_TICKS(duration_ms));
-        return;
+// ----------------------
+// Tick renderer
+// ----------------------
+// This generates exactly SAMPLES_PER_TICK samples each tick at 'freq' Hz,
+// preserving 'phase' across ticks to keep waveform continuous.
+static void render_tick(int16_t *buf, uint16_t freq, float *phase_io) {
+    float phase = *phase_io;
+    float step  = (freq == 0) ? 0.f : (2.0f * (float)M_PI * (float)freq / (float)SAMPLE_RATE);
+
+    if (freq == 0) {
+        // Silence (rest)
+        memset(buf, 0, SAMPLES_PER_TICK * sizeof(int16_t));
+    } else {
+        for (size_t i = 0; i < SAMPLES_PER_TICK; ++i) {
+            float s = sinf(phase) * volume;
+            // scale to int16
+            buf[i] = (int16_t)(s * 32767.0f);
+            phase += step;
+            if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+        }
     }
-
-    size_t samples_per_ms = SAMPLE_RATE / 1000;
-    size_t total_samples = samples_per_ms * duration_ms;
-    size_t buffer_size = 512;
-    int16_t *buffer = malloc(buffer_size * sizeof(int16_t));
-
-    if (buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate audio buffer");
-        return;
-    }
-
-    size_t remaining = total_samples;
-    while (remaining > 0 && audio_playing) {
-        size_t to_generate = (remaining > buffer_size) ? buffer_size : remaining;
-        generate_tone(buffer, to_generate, frequency);
-
-        size_t bytes_written;
-        i2s_write(I2S_NUM_0, buffer, to_generate * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-
-        remaining -= to_generate;
-    }
-
-    free(buffer);
+    *phase_io = phase;
 }
 
-// Playback task
-static void playback_task(void *pvParameters) {
-    uint8_t song_id = (uint8_t)(uintptr_t)pvParameters;
+// ----------------------
+// Role part selection / transform
+// ----------------------
+static void select_melody_for_role(const song_t *song, uint8_t role,
+                                   const note_t **out_notes, uint16_t *out_count)
+{
+    // Prefer explicit part if present
+    if (role >= ROLE_PART_1 && role <= ROLE_PART_4) {
+        int part_idx = (int)role; // ROLE_PART_1 = 1
+        if (song->parts[part_idx].notes && song->parts[part_idx].note_count) {
+            *out_notes = song->parts[part_idx].notes;
+            *out_count = song->parts[part_idx].note_count;
+            return;
+        }
+    }
+    // Fallback to lead
+    *out_notes = song->notes;
+    *out_count = song->note_count;
+}
+
+// Simple transform when we fell back to the lead melody (to create harmonies)
+static uint16_t transform_freq_for_role(uint16_t base_freq, uint8_t role) {
+    if (base_freq == 0) return 0;
+    switch (role) {
+        case ROLE_PART_1: return base_freq;                 // lead
+        case ROLE_PART_2: {                                  // down an octave (if too low, revert)
+            uint16_t f = (uint16_t)(base_freq / 2);
+            return (f < 50) ? base_freq : f;
+        }
+        case ROLE_PART_3: return (uint16_t)(base_freq * 2); // up an octave
+        case ROLE_PART_4: return (uint16_t)((base_freq * 3) / 2); // perfect fifth
+        default:          return base_freq;
+    }
+}
+
+// ----------------------
+// Playback task (tick-based)
+// ----------------------
+typedef struct {
+    uint8_t song_id;
+    uint8_t role;
+} play_role_param_t;
+
+static void playback_task(void *pv) {
+    play_role_param_t *p = (play_role_param_t *)pv;
+    uint8_t song_id = p->song_id;
+    uint8_t role    = p->role;
+    free(p);
 
     if (song_id >= total_songs) {
-        ESP_LOGE(TAG, "Invalid song ID: %d", song_id);
+        ESP_LOGE(TAG, "Invalid song ID: %u", (unsigned)song_id);
+        playback_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
 
     const song_t *song = &songs[song_id];
-    ESP_LOGI(TAG, "Playing: %s", song->name);
+    const note_t *mel  = NULL;
+    uint16_t count     = 0;
+
+    select_melody_for_role(song, role, &mel, &count);
+    bool using_lead = (mel == song->notes);
+
+    ESP_LOGI(TAG, "Starting tick playback: '%s' (notes=%u, role=%u)", song->name, (unsigned)count, (unsigned)role);
 
     audio_playing = true;
 
-    // Play all notes in the song
-    for (uint16_t i = 0; i < song->note_count && audio_playing; i++) {
-        play_note(song->notes[i].frequency, song->notes[i].duration_ms);
+    // Start equalizer animation
+    display_animations_start_playback(SONG_TYPE_SOLO);
+
+    // One tick buffer (tiny RAM)
+    static int16_t tick_buf[SAMPLES_PER_TICK];
+    float phase = 0.0f;
+
+    for (uint16_t i = 0; i < count && audio_playing; ++i) {
+        uint16_t freq = mel[i].frequency;
+        uint16_t dur  = mel[i].duration_ms;
+
+        if (using_lead) {
+            freq = transform_freq_for_role(freq, role);
+        }
+
+        // Pulse stronger exactly on note edge
+        display_animations_update_beat(pulse_intensity_for_note(freq, dur));
+
+        // Convert ms -> ticks (round to nearest, min 1 for any non-zero)
+        uint32_t ticks = (dur + (AUDIO_TICK_MS / 2)) / AUDIO_TICK_MS;
+        if (freq != 0 && ticks == 0) ticks = 1;
+
+        // Render this note in fixed-sized ticks
+        for (uint32_t t = 0; t < ticks && audio_playing; ++t) {
+            render_tick(tick_buf, freq, &phase);
+
+            size_t bytes_written = 0;
+            // I2S pacing is the wall clock (blocking until DMA has room)
+            ESP_ERROR_CHECK(i2s_write(I2S_NUM_0, tick_buf,
+                                      SAMPLES_PER_TICK * sizeof(int16_t),
+                                      &bytes_written, portMAX_DELAY));
+
+            // very small decay so bars don't stick at peak between ticks of the same note
+            // (keeps pulse feel without needing extra RAM)
+            if (freq != 0) {
+                display_animations_update_beat(0.25f);
+            } else {
+                display_animations_update_beat(0.0f);
+            }
+        }
+
+        // Optional tiny gap shaping (prevents harsh transitions), keep zero to disable
+        // phase is kept continuous; we don't reset it at note boundaries to avoid clicks
     }
 
+    // Song finished or stopped
     audio_playing = false;
-    ESP_LOGI(TAG, "Finished playing: %s", song->name);
+    display_animations_stop();
+    display_animations_start_idle();
 
+    ESP_LOGI(TAG, "Playback finished: '%s' (role=%u)", song->name, (unsigned)role);
     playback_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
-// Initialize audio system
+// ----------------------
+// Public API
+// ----------------------
 void audio_init(void) {
     audio_init_i2s();
     ESP_LOGI(TAG, "Audio system initialized");
 }
 
-// Forward declaration
-void audio_stop(void);
-
-// Start playing a song
-void audio_play_song(uint8_t song_id) {
-    // Stop any currently playing song
-    audio_stop();
-
-    // Start new playback task
-    xTaskCreate(playback_task, "playback", 4096, (void *)(uintptr_t)song_id, 10, &playback_task_handle);
-}
-
-// Stop playing
 void audio_stop(void) {
     audio_playing = false;
-
-    // Wait for playback task to finish
     if (playback_task_handle != NULL) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (playback_task_handle != NULL) {
@@ -144,11 +233,34 @@ void audio_stop(void) {
             playback_task_handle = NULL;
         }
     }
-
+    display_animations_stop();
+    display_animations_start_idle();
     ESP_LOGI(TAG, "Audio stopped");
 }
 
-// Set volume (0.0 to 1.0)
+void audio_play_song(uint8_t song_id) {
+    audio_stop();
+
+    play_role_param_t *p = (play_role_param_t *)malloc(sizeof(*p));
+    if (!p) { ESP_LOGE(TAG, "alloc play param failed"); return; }
+    p->song_id = song_id;
+    p->role    = (uint8_t)device_config_get_role();
+
+    // Higher prio than UI; modest stack is enough (tick buffer is static)
+    xTaskCreate(playback_task, "playback_tick", 4096, p, 10, &playback_task_handle);
+}
+
+void audio_play_song_for_role(uint8_t song_id, uint8_t role) {
+    audio_stop();
+
+    play_role_param_t *p = (play_role_param_t *)malloc(sizeof(*p));
+    if (!p) { ESP_LOGE(TAG, "alloc play param failed"); return; }
+    p->song_id = song_id;
+    p->role    = role;
+
+    xTaskCreate(playback_task, "playback_tick", 4096, p, 10, &playback_task_handle);
+}
+
 void audio_set_volume(float vol) {
     if (vol < 0.0f) vol = 0.0f;
     if (vol > 1.0f) vol = 1.0f;
@@ -156,7 +268,4 @@ void audio_set_volume(float vol) {
     ESP_LOGI(TAG, "Volume set to %.2f", volume);
 }
 
-// Check if audio is currently playing
-bool audio_is_playing(void) {
-    return audio_playing;
-}
+bool audio_is_playing(void) { return audio_playing; }
